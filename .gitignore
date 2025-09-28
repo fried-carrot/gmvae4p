@@ -1,14 +1,13 @@
-# Data directories
+# directories
 data/
 processed_data/
 
-# PDF files
 *.pdf
 
-# Nested repositories
+# repositories
 repositories/
 
-# System files
+# sys files
 .DS_Store
 __pycache__/
 *.pyc
@@ -33,10 +32,10 @@ coverage.xml
 .pytest_cache
 .hypothesis
 
-# Jupyter Notebook
+# notebooks
 .ipynb_checkpoints
 
-# Model files (if large)
+# model files
 *.pkl
 *.h5
 *.hdf5
