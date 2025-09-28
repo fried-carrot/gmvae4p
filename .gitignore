@@ -5,6 +5,9 @@ processed_data/
 # PDF files
 *.pdf
 
+# Nested repositories
+repositories/
+
 # System files
 .DS_Store
 __pycache__/
