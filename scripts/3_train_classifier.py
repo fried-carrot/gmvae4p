@@ -11,7 +11,7 @@ import pandas as pd
 import os
 import json
 import argparse
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score, confusion_matrix
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score, confusion_matrix, f1_score
 from torch.utils.data import DataLoader, TensorDataset
 import scipy.io as sio
 
@@ -28,13 +28,14 @@ GMVAE_ZINB = train_gmvae_module.GMVAE_ZINB
 p4p_model_spec = importlib.util.spec_from_file_location("p4p_model", os.path.join(os.path.dirname(__file__), "../repositories/ProtoCell4P/src/model.py"))
 p4p_model_module = importlib.util.module_from_spec(p4p_model_spec)
 p4p_model_spec.loader.exec_module(p4p_model_module)
-P4PModel = p4p_model_module.ProtoCell4P
+P4PModel = p4p_model_module.ProtoCell
 
 
 
 class P4PxGMVAE(P4PModel):
     """
-    P4P w/ GMVAE z-score replacement for distance calc
+    P4P w/ GMVAE embeddings replacing P4P's encoder
+    Uses GMVAE-derived z-scores as cell-to-prototype distances
     """
 
     def __init__(self, *args, **kwargs):
@@ -42,12 +43,13 @@ class P4PxGMVAE(P4PModel):
         self.gmvae_model = None
 
     def set_gmvae_model(self, gmvae_model):
-        """set the GMVAE model for z-score"""
+        """set the frozen GMVAE model for feature extraction"""
         self.gmvae_model = gmvae_model
+        self.gmvae_model.eval()
 
     def forward(self, x, y, ct=None, sparse=True):
         # from: ProtoCell4P/src/model.py lines 64-96
-        # P4P forward pass w/ distance calc changed
+        # Modified: use GMVAE embeddings instead of P4P encoder
 
         split_idx = [0]
         for i in range(len(x)):
@@ -59,35 +61,42 @@ class P4PxGMVAE(P4PModel):
             x_concat = torch.cat([torch.tensor(x[i]) for i in range(len(x))]).to(self.device)
         y = y.to(self.device)
 
-        z = self.encode(x_concat)
-        import_scores = self.compute_importance(x_concat) # (n_cell, n_proto, n_class)
-
-        # replace prototype distances with GMVAE z-scores
-        if self.gmvae_model is not None and ct is not None:
-            # compute z-scores using GMVAE global cell type
-            global_means = self.gmvae_model.mu_prior  # (n_components, latent_dim)
-            global_logvars = self.gmvae_model.logvar_prior  # (n_components, latent_dim)
-            global_stds = torch.exp(0.5 * global_logvars)
-
-            cell_types_concat = torch.cat([torch.tensor(ct[i]) for i in range(len(ct))])
-
-            z_scores_list = []
-            for cell_idx, cell_type in enumerate(cell_types_concat):
-                if cell_type < len(global_means):  # bounds check
-                    global_mean = global_means[cell_type]
-                    global_std = global_stds[cell_type]
-                    z_score = torch.norm((z[cell_idx] - global_mean) / (global_std + 1e-8))
-                    z_scores_list.append(z_score)
-                else:
-                    z_scores_list.append(torch.tensor(1.0).to(self.device))  # fallback
-
-            c2p_dists = torch.stack(z_scores_list).unsqueeze(1).expand(-1, self.n_proto)
+        # use GMVAE embeddings instead of P4P encoder
+        if self.gmvae_model is not None:
+            gmvae_z = self.gmvae_model.get_embeddings(x_concat)  # (n_cells, z_dim)
         else:
-            # og: c2p_dists = torch.pow(z[:, None] - self.prototypes[None, :], 2).sum(-1)
-            c2p_dists = torch.pow(z[:, None] - self.prototypes[None, :], 2).sum(-1)
+            # fallback to P4P encoder if GMVAE not set
+            gmvae_z = self.encode(x_concat)
 
-        # rest of forward pass
-        c_logits = (1 / (c2p_dists+0.5))[:,None,:].matmul(import_scores).squeeze(1) # (n_cell, n_classes)
+        import_scores = self.compute_importance(x_concat)  # (n_cell, n_proto, n_class)
+
+        # compute z-scores as cell-to-prototype distances
+        if self.gmvae_model is not None and ct is not None:
+            # use GMVAE's learned cell type distributions for z-score calculation
+            cell_types_concat = torch.cat([torch.tensor(ct[i]) for i in range(len(ct))]).to(self.device)
+
+            # get global cell type priors
+            mu_prior = self.gmvae_model.mu_prior  # (K, z_dim)
+            logvar_prior = self.gmvae_model.logvar_prior  # (K, z_dim)
+            std_prior = torch.exp(0.5 * logvar_prior)  # (K, z_dim)
+
+            # compute z-scores: (embedding - cell_type_mean) / cell_type_std
+            # for each cell, get its cell type's global distribution
+            cell_means = mu_prior[cell_types_concat]  # (n_cells, z_dim)
+            cell_stds = std_prior[cell_types_concat]  # (n_cells, z_dim)
+
+            # z-score per dimension
+            z_scores = (gmvae_z - cell_means) / (cell_stds + 1e-8)  # (n_cells, z_dim)
+
+            # compute distances from z-scores to prototypes
+            # use squared distance in z-score space
+            c2p_dists = torch.pow(z_scores[:, None, :] - self.prototypes[None, :, :], 2).sum(-1)  # (n_cells, n_proto)
+        else:
+            # fallback: standard Euclidean distance
+            c2p_dists = torch.pow(gmvae_z[:, None] - self.prototypes[None, :], 2).sum(-1)
+
+        # rest of P4P forward pass (unchanged)
+        c_logits = (1 / (c2p_dists+0.5))[:,None,:].matmul(import_scores).squeeze(1)  # (n_cell, n_classes)
         logits = torch.stack([c_logits[split_idx[i]:split_idx[i+1]].mean(dim=0) for i in range(len(split_idx)-1)])
 
         clf_loss = self.ce_(logits, y)
@@ -199,16 +208,24 @@ def train_classifier(X_patients, y_patients, ct_patients, gmvae_model, n_genes, 
     ct_test = [ct_patients[i] for i in indices[train_size:]]
 
     # initialize P4P model with GMVAE modification
+    lambdas = {
+        "lambda_1": 0,
+        "lambda_2": 0,
+        "lambda_3": 0,
+        "lambda_4": 0,
+        "lambda_5": 0,
+        "lambda_6": 1
+    }
     model = P4PxGMVAE(
         input_dim=n_genes,
         h_dim=128,  # from P4P hyperparameters
-        z_dim=64,   # from P4P hyperparameters
+        z_dim=64,   # from P4P hyperparameters (must match GMVAE z_dim)
         n_layers=2,
         n_proto=8,  # from P4P hyperparameters
         n_classes=n_classes,
+        lambdas=lambdas,  # P4P expects dict, not kwargs
         n_ct=n_cell_types,
-        device=device,
-        lambda_1=0, lambda_2=0, lambda_3=0, lambda_4=0, lambda_5=0, lambda_6=1  # from P4P
+        device=device
     ).to(device)
 
     model.set_gmvae_model(gmvae_model)

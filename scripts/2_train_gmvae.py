@@ -162,11 +162,15 @@ class GMVAE_ZINB(nn.Module):
         # for P4P patient classification
         self.eval()
         with torch.no_grad():
-            # use mixture assignment for embeddings
+            x = x.to(self.device)
+            # use mixture assignment probabilities to weight embeddings
             pi_x = self.pi_of_x(x)
             mu_zs, logvar_zs = self.musig_of_z(x)
-            # return mean of posterior for inference
-            return mu_zs.mean(dim=2)  # average across mixture components
+            # return weighted sum across mixture components
+            # pi_x: (batch, K), mu_zs: (batch, z_dim, K)
+            # expand pi_x to (batch, z_dim, K) and sum over K
+            weighted_mu = (mu_zs * pi_x.unsqueeze(1)).sum(dim=2)  # (batch, z_dim)
+            return weighted_mu
 
 
 def gmvae_losses(Xdata, Xtarget, pi_x, mu_zs, logvar_zs, z_samples, mu_genz, logvar_genz,\
@@ -222,27 +226,23 @@ def gmvae_losses(Xdata, Xtarget, pi_x, mu_zs, logvar_zs, z_samples, mu_genz, log
     return total_loss, KLD_gaussian, KLD_pi, zinb_loss
 
 
-# create args object for P4P (new)
+# create args object for GMVAE (new)
 class Args:
-    def __init__(self, input_dim, n_cell_types, use_disease_states=True, device='cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, input_dim, n_cell_types, device='cuda' if torch.cuda.is_available() else 'cpu'):
         self.input_dim = input_dim
-        if use_disease_states:
-            self.K = n_cell_types * 2  # 2 components per cell type (healthy + diseased)
-        else:
-            self.K = n_cell_types  # 1 component per cell type
+        self.K = n_cell_types  # K mixture components = number of cell types
         self.z_dim = 64
         self.h_dim = 512
         self.h_dim1 = 512
         self.h_dim2 = 256
         self.device = device
-        self.use_disease_states = use_disease_states
 
 
 def train_gmvae(data_loader, input_dim, n_cell_types, save_path, epochs=100,
-                learning_rate=1e-3, use_disease_states=True, device='cuda' if torch.cuda.is_available() else 'cpu'):
+                learning_rate=1e-3, device='cuda' if torch.cuda.is_available() else 'cpu'):
 
     # create args for original bulk2sc model (new)
-    args = Args(input_dim, n_cell_types, use_disease_states, device)
+    args = Args(input_dim, n_cell_types, device)
 
     model = GMVAE_ZINB(args).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
@@ -250,10 +250,7 @@ def train_gmvae(data_loader, input_dim, n_cell_types, save_path, epochs=100,
     print(f"training GMVAE on {device}")
     print(f"input dimension: {input_dim}")
     print(f"cell types: {n_cell_types}")
-    if args.use_disease_states:
-        print(f"mixture components: {args.K} (2 per cell type: healthy + diseased)")
-    else:
-        print(f"mixture components: {args.K} (1 per cell type)")
+    print(f"mixture components (K): {args.K}")
     print()
 
     model.train()
@@ -295,6 +292,16 @@ def train_gmvae(data_loader, input_dim, n_cell_types, save_path, epochs=100,
         if epoch % 10 == 0:
             print(f"epoch {epoch:3d}: loss={avg_loss:.4f}, recon={avg_recon:.4f}, kld={avg_kld:.4f}")
 
+    # compute and store global cell type priors (for z-score calculation in classifier)
+    model.eval()
+    with torch.no_grad():
+        # compute global means and logvars for each mixture component
+        mu_genz, logvar_genz = model.musig_of_genz(model.onehot, batchsize=1)
+        # mu_genz, logvar_genz: (1, z_dim, K) -> transpose to (K, z_dim)
+        model.mu_prior = mu_genz.squeeze(0).transpose(0, 1)  # (K, z_dim)
+        model.logvar_prior = logvar_genz.squeeze(0).transpose(0, 1)  # (K, z_dim)
+        print(f"stored global priors: mu_prior {model.mu_prior.shape}, logvar_prior {model.logvar_prior.shape}")
+
     # freeze model
     model.freeze_model()
 
@@ -302,6 +309,8 @@ def train_gmvae(data_loader, input_dim, n_cell_types, save_path, epochs=100,
     torch.save({
         'model_state_dict': model.state_dict(),
         'args': args,
+        'mu_prior': model.mu_prior,
+        'logvar_prior': model.logvar_prior,
         'training_config': {
             'epochs': epochs,
             'learning_rate': learning_rate,
@@ -319,6 +328,11 @@ def load_frozen_gmvae(model_path, device='cuda' if torch.cuda.is_available() els
 
     model = GMVAE_ZINB(checkpoint['args']).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
+
+    # restore global priors
+    model.mu_prior = checkpoint['mu_prior'].to(device)
+    model.logvar_prior = checkpoint['logvar_prior'].to(device)
+
     model.freeze_model()
 
     return model
@@ -379,8 +393,7 @@ if __name__ == "__main__":
         n_cell_types=n_cell_types,
         save_path=args.output,
         epochs=args.epochs,
-        learning_rate=args.learning_rate,
-        use_disease_states=True  # configurable: True=healthy+diseased, False=cell types only
+        learning_rate=args.learning_rate
     )
 
     print("\nGMVAE trained")
