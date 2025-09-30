@@ -23,6 +23,7 @@ spec = importlib.util.spec_from_file_location("train_gmvae", os.path.join(os.pat
 train_gmvae_module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(train_gmvae_module)
 GMVAE_ZINB = train_gmvae_module.GMVAE_ZINB
+Args = train_gmvae_module.Args  # needed for loading checkpoint
 
 # import P4P model
 p4p_model_spec = importlib.util.spec_from_file_location("p4p_model", os.path.join(os.path.dirname(__file__), "../repositories/ProtoCell4P/src/model.py"))
@@ -56,9 +57,9 @@ class P4PxGMVAE(P4PModel):
             split_idx.append(split_idx[-1]+x[i].shape[0])
 
         if sparse:
-            x_concat = torch.cat([torch.tensor(x[i].toarray()) for i in range(len(x))]).to(self.device)
+            x_concat = torch.cat([torch.tensor(x[i].toarray(), dtype=torch.float32) for i in range(len(x))]).to(self.device)
         else:
-            x_concat = torch.cat([torch.tensor(x[i]) for i in range(len(x))]).to(self.device)
+            x_concat = torch.cat([torch.tensor(x[i], dtype=torch.float32) for i in range(len(x))]).to(self.device)
         y = y.to(self.device)
 
         # use GMVAE embeddings instead of P4P encoder
@@ -116,11 +117,16 @@ class P4PxGMVAE(P4PModel):
 
 def load_frozen_gmvae(model_path, device='cuda' if torch.cuda.is_available() else 'cpu'):
     # load trained GMVAE
-    checkpoint = torch.load(model_path, map_location=device)
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
 
     # use trained Bulk2SC GMVAE_ZINB model
     model = GMVAE_ZINB(checkpoint['args']).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
+
+    # restore global priors
+    model.mu_prior = checkpoint['mu_prior'].to(device)
+    model.logvar_prior = checkpoint['logvar_prior'].to(device)
+
     model.freeze_model()
 
     return model
@@ -167,7 +173,7 @@ def prepare_patient_data(data_dir, device='cpu'):
     y_patients_tensor = torch.tensor(y_patients)
 
     print(f"prepared {len(X_patients)} patients")
-    print(f"cells per patient: min={min(len(x) for x in X_patients)}, max={max(len(x) for x in X_patients)}, mean={np.mean([len(x) for x in X_patients]):.1f}")
+    print(f"cells per patient: min={min(x.shape[0] for x in X_patients)}, max={max(x.shape[0] for x in X_patients)}, mean={np.mean([x.shape[0] for x in X_patients]):.1f}")
 
     # load metadata
     with open(os.path.join(data_dir, "metadata.json"), 'r') as f:
