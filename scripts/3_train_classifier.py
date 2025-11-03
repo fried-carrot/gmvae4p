@@ -62,18 +62,18 @@ class P4PxGMVAE(P4PModel):
             x_concat = torch.cat([torch.tensor(x[i], dtype=torch.float32) for i in range(len(x))]).to(self.device)
         y = y.to(self.device)
 
-        # use GMVAE embeddings instead of P4P encoder
+        # use GMVAE embeddings
         if self.gmvae_model is not None:
             gmvae_z = self.gmvae_model.get_embeddings(x_concat)  # (n_cells, z_dim)
         else:
-            # fallback to P4P encoder if GMVAE not set
+            # fallback if GMVAE not set
             gmvae_z = self.encode(x_concat)
 
         import_scores = self.compute_importance(x_concat)  # (n_cell, n_proto, n_class)
 
         # compute z-scores as cell-to-prototype distances
         if self.gmvae_model is not None and ct is not None:
-            # use GMVAE's learned cell type distributions for z-score calculation
+            # use GMVAE's cell type distributions for z-score calculation
             cell_types_concat = torch.cat([torch.tensor(ct[i]) for i in range(len(ct))]).to(self.device)
 
             # get global cell type priors
@@ -119,13 +119,20 @@ def load_frozen_gmvae(model_path, device='cuda' if torch.cuda.is_available() els
     # load trained GMVAE
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
 
+    # override args device with current device
+    args = checkpoint['args']
+    args.device = device
+
     # use trained Bulk2SC GMVAE_ZINB model
-    model = GMVAE_ZINB(checkpoint['args']).to(device)
+    model = GMVAE_ZINB(args).to(device)
     model.load_state_dict(checkpoint['model_state_dict'])
 
     # restore global priors
     model.mu_prior = checkpoint['mu_prior'].to(device)
     model.logvar_prior = checkpoint['logvar_prior'].to(device)
+
+    # ensure onehot tensor is on correct device
+    model.onehot = model.onehot.to(device)
 
     model.freeze_model()
 
