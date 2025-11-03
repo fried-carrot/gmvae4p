@@ -259,6 +259,8 @@ def train_gmvae(data_loader, input_dim, n_cell_types, save_path, epochs=100,
         total_recon_loss = 0
         total_kld_loss = 0
         n_batches = 0
+        correct_predictions = 0
+        total_predictions = 0
 
         for batch_idx, (batch, labels) in enumerate(data_loader):
             x = batch.to(device)
@@ -285,12 +287,18 @@ def train_gmvae(data_loader, input_dim, n_cell_types, save_path, epochs=100,
             total_kld_loss += (KLD_gaussian + KLD_pi).item()
             n_batches += 1
 
+            # cell type classification accuracy
+            predicted_cell_types = pi_x.argmax(dim=1)
+            correct_predictions += (predicted_cell_types == targets).sum().item()
+            total_predictions += targets.size(0)
+
         avg_loss = total_loss / n_batches
         avg_recon = total_recon_loss / n_batches
         avg_kld = total_kld_loss / n_batches
+        cell_type_acc = correct_predictions / total_predictions
 
         if epoch % 10 == 0:
-            print(f"epoch {epoch:3d}: loss={avg_loss:.4f}, recon={avg_recon:.4f}, kld={avg_kld:.4f}")
+            print(f"epoch {epoch:3d}: loss={avg_loss:.4f}, recon={avg_recon:.4f}, kld={avg_kld:.4f}, cell_type_acc={cell_type_acc:.4f}")
 
     # compute and store global cell type priors (for z-score calculation in classifier)
     model.eval()
